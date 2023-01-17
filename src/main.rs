@@ -1,51 +1,70 @@
-use flake_server::ThreadPool;
-use std::fs;
-use std::io::prelude::*;
-use std::net::TcpListener;
-use std::net::TcpStream;
-use std::thread;
-use std::time::Duration;
+use flo_stream::{MessagePublisher, Publisher};
 
-fn main() {
-    let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
-    let pool = ThreadPool::new(4);
+use futures_util::{FutureExt, StreamExt};
+use std::sync::Arc;
+use tokio::io::AsyncBufReadExt;
 
-    for stream in listener.incoming().take(2) {
-        let stream = stream.unwrap();
+use warp::{ws::Message, Filter};
 
-        pool.execute(|| {
-            handle_connection(stream);
+async fn run_server() -> () {
+    let publisher: Arc<Publisher<Message>> = Arc::new(Publisher::new(10));
+    let mut republisher = publisher.republish_weak();
+
+    let reader = tokio::io::BufReader::new(tokio::io::stdin());
+    let lines = reader.lines();
+    tokio::spawn(async move {
+        tokio::pin!(lines);
+        while let Ok(item) = lines.next_line().await {
+            let res: Message = match item {
+                Some(item) => Message::text(item),
+                // None => warp::Error::new(Box::new(MyError::Other)),
+                None => todo!(),
+            };
+            republisher.publish(res).await;
+        }
+    });
+
+    let routes = warp::path("socket")
+        // The `ws()` filter will prepare the Websocket handshake.
+        .and(warp::ws())
+        .map(move |ws: warp::ws::Ws| {
+            let mut republisher = publisher.republish_weak();
+            let subscriber = republisher.subscribe();
+            // And then our closure will be called when it completes...
+            ws.on_upgrade(|websocket| {
+                // Echo from stdin to websockets
+
+                let (tx, _rx) = websocket.split();
+
+                subscriber
+                    .map(|message| dbg!(Ok(message)))
+                    .forward(tx)
+                    .map(|result| match result {
+                        Ok(_) => println!("websocket closed"),
+                        Err(e) => eprintln!("websocket error: {:?}", e),
+                    })
+            })
         });
-    }
 
-    println!("Shutting down.");
+    // let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+
+    // let mut lines = reader.lines();
+
+    // let stream = async_stream::stream! {
+    //     while let Ok(item) = lines.next_line().await {
+    //         let res: Message = match item {
+    //             Some(item) => Message::text(item),
+    //             // None => warp::Error::new(Box::new(MyError::Other)),
+    //             None => todo!(),
+    //         };
+    //         yield res.clone();
+    //     }
+    // };
+
+    warp::serve(routes).run(([127, 0, 0, 1], 3030)).await;
 }
 
-fn handle_connection(mut stream: TcpStream) {
-    let mut buffer = [0; 1024];
-    stream.read(&mut buffer).unwrap();
-
-    let get = b"GET / HTTP/1.1\r\n";
-    let sleep = b"GET /sleep HTTP/1.1\r\n";
-
-    let (status_line, filename) = if buffer.starts_with(get) {
-        ("HTTP/1.1 200 OK", "hello.html")
-    } else if buffer.starts_with(sleep) {
-        thread::sleep(Duration::from_secs(5));
-        ("HTTP/1.1 200 OK", "hello.html")
-    } else {
-        ("HTTP/1.1 404 NOT FOUND", "404.html")
-    };
-
-    let contents = fs::read_to_string(filename).unwrap();
-
-    let response = format!(
-        "{}\r\nContent-Length: {}\r\n\r\n{}",
-        status_line,
-        contents.len(),
-        contents
-    );
-
-    stream.write_all(response.as_bytes()).unwrap();
-    stream.flush().unwrap();
+#[tokio::main]
+async fn main() {
+    run_server().await
 }
